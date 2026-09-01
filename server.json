@@ -1,17 +1,17 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.selflabbs/weather-intel-mcp",
+  "name": "io.github.datakoot/us-weather-forecast-alerts",
   "title": "Weather & Geo Intel MCP",
   "description": "US weather & geo for AI agents: forecasts, alerts, earthquakes, elevation, geocoding. No keys.",
-  "version": "1.0.0",
+  "version": "2.1.0",
   "repository": {
-    "url": "https://github.com/selflabbs/weather-intel-mcp",
+    "url": "https://github.com/datakoot/weather-intel-mcp",
     "source": "github"
   },
   "remotes": [
     {
       "type": "streamable-http",
-      "url": "https://weather.selflabbs.com/mcp"
+      "url": "https://weather.datakoot.com/mcp"
     }
   ]
 }
