@@ -1,6 +1,6 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.datakoot/us-weather-forecast-alerts",
+  "name": "com.datakoot/us-weather-forecast-alerts",
   "title": "Weather & Geo Intel MCP",
   "description": "US weather & geo for AI agents: forecasts, alerts, earthquakes, elevation, geocoding. No keys.",
   "version": "2.1.0",
