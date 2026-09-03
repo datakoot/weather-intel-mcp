@@ -87,13 +87,25 @@ TENNESSEE:"TN",TEXAS:"TX",UTAH:"UT",VERMONT:"VT",VIRGINIA:"VA",WASHINGTON:"WA",
 const DK_FIPS_TO_ABBR = Object.keys(DK_FIPS).reduce(function (a, k) { a[DK_FIPS[k]] = k; return a; }, {});
 const DK_TIGER = "https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/Places_CouSub_ConCity_SubMCD/MapServer";
 
+// Tokens that mean "United States" and are fine as a trailing qualifier.
+const DK_US_WORDS = { "US":1, "USA":1, "U.S.":1, "U.S.A.":1, "UNITED STATES":1,
+  "UNITED STATES OF AMERICA":1, "AMERICA":1 };
+
 function dkParsePlace(q) {
   const parts = String(q).split(",").map(function (x) { return x.trim(); }).filter(Boolean);
-  let place = parts[0] || "", st = null;
+  let place = parts[0] || "", st = null, foreignQualifier = null;
   if (parts.length > 1) {
     const tail = parts[parts.length - 1].toUpperCase().replace(/\.$/, "");
     if (DK_FIPS[tail]) st = tail;
     else if (DK_STATE_NAMES[tail]) st = DK_STATE_NAMES[tail];
+    else if (!DK_US_WORDS[tail]) {
+      // An explicit qualifier was given and it is neither a US state nor "USA".
+      // Almost always this is a foreign "City, Country" - e.g. "London, England".
+      // Record it so we refuse rather than silently matching a US town of the
+      // same name. (A US "City, County" with no state still lands here; that is
+      // acceptable - the caller can re-issue with the state.)
+      foreignQualifier = parts[parts.length - 1];
+    }
   }
   // strip a trailing bare state on a comma-less query: "Springdale Arkansas"
   if (!st && parts.length === 1) {
@@ -105,34 +117,44 @@ function dkParsePlace(q) {
       if (take === 1 && DK_FIPS[cand]) { st = cand; place = w.slice(0, -1).join(" "); break; }
     }
   }
-  place = place.replace(/\b(city|town|village|borough|municipality)\b\s*$/i, "").trim();
-  return { place: place, state: st };
+  return { place: place.trim(), state: st, foreignQualifier: foreignQualifier };
 }
 
 async function censusPlace(query) {
   const parsed = dkParsePlace(query);
   if (!parsed.place) return [];
-  const esc = parsed.place.replace(/'/g, "''");
-  let where = "BASENAME='" + esc + "'";
-  if (parsed.state && DK_FIPS[parsed.state]) where += " AND STATE='" + DK_FIPS[parsed.state] + "'";
+  if (parsed.foreignQualifier && !parsed.state) {
+    return { _foreign: parsed.foreignQualifier, _place: parsed.place };
+  }
+  // Candidate names to try, in order. The FULL name goes first so "Kansas City"
+  // matches BASENAME='Kansas City'. Only if that misses do we try a variant with
+  // a redundant trailing designator removed, so "Springfield city" -> "Springfield".
+  const stateSql = (parsed.state && DK_FIPS[parsed.state]) ? " AND STATE='" + DK_FIPS[parsed.state] + "'" : "";
+  const candidates = [parsed.place];
+  const stripped = parsed.place.replace(/\b(township|village|borough|municipality)\b\s*$/i, "")
+    .replace(/\s+(city|town)$/i, "").trim();
+  if (stripped && stripped.toLowerCase() !== parsed.place.toLowerCase()) candidates.push(stripped);
   let anyUpstreamError = null;
-  for (const layer of [4, 5]) {           // 4 = Incorporated Places, 5 = Census Designated Places
-    const u = DK_TIGER + "/" + layer + "/query?where=" + encodeURIComponent(where) +
-      "&outFields=NAME,STATE,BASENAME,CENTLAT,CENTLON&returnGeometry=false&f=json";
-    const d = await getJSON(u, { ttl: 604800 });
-    if (!d || d._error) { anyUpstreamError = (d && d._error) || "upstream unreachable"; continue; }
-    const feats = Array.isArray(d.features) ? d.features : [];
-    if (feats.length) {
-      return feats.slice(0, 5).map(function (f) {
-        const a = f.attributes || {};
-        const abbr = DK_FIPS_TO_ABBR[a.STATE] || a.STATE;
-        return {
-          matched_address: (a.NAME || a.BASENAME) + (abbr ? ", " + abbr : ""),
-          lat: a.CENTLAT != null ? parseFloat(a.CENTLAT) : null,
-          lon: a.CENTLON != null ? parseFloat(a.CENTLON) : null,
-          match_type: layer === 4 ? "incorporated_place" : "census_designated_place",
-        };
-      });
+  for (const cand of candidates) {
+    const where = "BASENAME='" + cand.replace(/'/g, "''") + "'" + stateSql;
+    for (const layer of [4, 5]) {           // 4 = Incorporated Places, 5 = Census Designated Places
+      const u = DK_TIGER + "/" + layer + "/query?where=" + encodeURIComponent(where) +
+        "&outFields=NAME,STATE,BASENAME,CENTLAT,CENTLON&returnGeometry=false&f=json";
+      const d = await getJSON(u, { ttl: 604800 });
+      if (!d || d._error) { anyUpstreamError = (d && d._error) || "upstream unreachable"; continue; }
+      const feats = Array.isArray(d.features) ? d.features : [];
+      if (feats.length) {
+        return feats.slice(0, 5).map(function (f) {
+          const a = f.attributes || {};
+          const abbr = DK_FIPS_TO_ABBR[a.STATE] || a.STATE;
+          return {
+            matched_address: (a.NAME || a.BASENAME) + (abbr ? ", " + abbr : ""),
+            lat: a.CENTLAT != null ? parseFloat(a.CENTLAT) : null,
+            lon: a.CENTLON != null ? parseFloat(a.CENTLON) : null,
+            match_type: layer === 4 ? "incorporated_place" : "census_designated_place",
+          };
+        });
+      }
     }
   }
   if (anyUpstreamError) return { _error: anyUpstreamError };
@@ -202,6 +224,7 @@ async function runTool(name, args) {
       // The street-address geocoder found nothing. That is not the same as
       // "no such place" - try the Census place gazetteer before giving up.
       const p = await censusPlace(args.address);
+      if (p && p._foreign) return { error: "Datakoot geocode covers US locations only, and '" + p._foreign + "' is not a US state. '" + args.address + "' looks like a location outside the United States. If you did mean a US place, drop the qualifier or use its two-letter state (for example '" + p._place + ", OH')." };
       if (p && p._error) return { error: "The US Census address geocoder found no street match for '" + args.address + "', and the Census place service is not answering right now (" + p._error + "). This is an upstream failure, NOT a statement that the place does not exist. Try again shortly." };
       if (p && p.length) { m = p; matchedBy = "place_name"; }
     }
