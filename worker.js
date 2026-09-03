@@ -65,6 +65,80 @@ async function nwsPoint(lat, lon) {
   };
 }
 
+// --- Place-name geocoding (US Census TIGERweb, public domain, keyless) ---
+// The onelineaddress geocoder above matches STREET ADDRESSES only. "Chicago, IL"
+// returns nothing from it, which read to callers as "that place does not exist".
+// This resolves a city, town or CDP to its centroid instead.
+const DK_FIPS = {AL:"01",AK:"02",AZ:"04",AR:"05",CA:"06",CO:"08",CT:"09",DE:"10",DC:"11",
+FL:"12",GA:"13",HI:"15",ID:"16",IL:"17",IN:"18",IA:"19",KS:"20",KY:"21",LA:"22",ME:"23",
+MD:"24",MA:"25",MI:"26",MN:"27",MS:"28",MO:"29",MT:"30",NE:"31",NV:"32",NH:"33",NJ:"34",
+NM:"35",NY:"36",NC:"37",ND:"38",OH:"39",OK:"40",OR:"41",PA:"42",RI:"44",SC:"45",SD:"46",
+TN:"47",TX:"48",UT:"49",VT:"50",VA:"51",WA:"53",WV:"54",WI:"55",WY:"56",PR:"72"};
+const DK_STATE_NAMES = {ALABAMA:"AL",ALASKA:"AK",ARIZONA:"AZ",ARKANSAS:"AR",CALIFORNIA:"CA",
+COLORADO:"CO",CONNECTICUT:"CT",DELAWARE:"DE","DISTRICT OF COLUMBIA":"DC",FLORIDA:"FL",
+GEORGIA:"GA",HAWAII:"HI",IDAHO:"ID",ILLINOIS:"IL",INDIANA:"IN",IOWA:"IA",KANSAS:"KS",
+KENTUCKY:"KY",LOUISIANA:"LA",MAINE:"ME",MARYLAND:"MD",MASSACHUSETTS:"MA",MICHIGAN:"MI",
+MINNESOTA:"MN",MISSISSIPPI:"MS",MISSOURI:"MO",MONTANA:"MT",NEBRASKA:"NE",NEVADA:"NV",
+"NEW HAMPSHIRE":"NH","NEW JERSEY":"NJ","NEW MEXICO":"NM","NEW YORK":"NY",
+"NORTH CAROLINA":"NC","NORTH DAKOTA":"ND",OHIO:"OH",OKLAHOMA:"OK",OREGON:"OR",
+PENNSYLVANIA:"PA","RHODE ISLAND":"RI","SOUTH CAROLINA":"SC","SOUTH DAKOTA":"SD",
+TENNESSEE:"TN",TEXAS:"TX",UTAH:"UT",VERMONT:"VT",VIRGINIA:"VA",WASHINGTON:"WA",
+"WEST VIRGINIA":"WV",WISCONSIN:"WI",WYOMING:"WY","PUERTO RICO":"PR"};
+const DK_FIPS_TO_ABBR = Object.keys(DK_FIPS).reduce(function (a, k) { a[DK_FIPS[k]] = k; return a; }, {});
+const DK_TIGER = "https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/Places_CouSub_ConCity_SubMCD/MapServer";
+
+function dkParsePlace(q) {
+  const parts = String(q).split(",").map(function (x) { return x.trim(); }).filter(Boolean);
+  let place = parts[0] || "", st = null;
+  if (parts.length > 1) {
+    const tail = parts[parts.length - 1].toUpperCase().replace(/\.$/, "");
+    if (DK_FIPS[tail]) st = tail;
+    else if (DK_STATE_NAMES[tail]) st = DK_STATE_NAMES[tail];
+  }
+  // strip a trailing bare state on a comma-less query: "Springdale Arkansas"
+  if (!st && parts.length === 1) {
+    const w = place.split(/\s+/);
+    for (let take = 2; take >= 1; take--) {
+      if (w.length <= take) continue;   // skip this width, do not abandon the loop
+      const cand = w.slice(-take).join(" ").toUpperCase().replace(/\.$/, "");
+      if (DK_STATE_NAMES[cand]) { st = DK_STATE_NAMES[cand]; place = w.slice(0, -take).join(" "); break; }
+      if (take === 1 && DK_FIPS[cand]) { st = cand; place = w.slice(0, -1).join(" "); break; }
+    }
+  }
+  place = place.replace(/\b(city|town|village|borough|municipality)\b\s*$/i, "").trim();
+  return { place: place, state: st };
+}
+
+async function censusPlace(query) {
+  const parsed = dkParsePlace(query);
+  if (!parsed.place) return [];
+  const esc = parsed.place.replace(/'/g, "''");
+  let where = "BASENAME='" + esc + "'";
+  if (parsed.state && DK_FIPS[parsed.state]) where += " AND STATE='" + DK_FIPS[parsed.state] + "'";
+  let anyUpstreamError = null;
+  for (const layer of [4, 5]) {           // 4 = Incorporated Places, 5 = Census Designated Places
+    const u = DK_TIGER + "/" + layer + "/query?where=" + encodeURIComponent(where) +
+      "&outFields=NAME,STATE,BASENAME,CENTLAT,CENTLON&returnGeometry=false&f=json";
+    const d = await getJSON(u, { ttl: 604800 });
+    if (!d || d._error) { anyUpstreamError = (d && d._error) || "upstream unreachable"; continue; }
+    const feats = Array.isArray(d.features) ? d.features : [];
+    if (feats.length) {
+      return feats.slice(0, 5).map(function (f) {
+        const a = f.attributes || {};
+        const abbr = DK_FIPS_TO_ABBR[a.STATE] || a.STATE;
+        return {
+          matched_address: (a.NAME || a.BASENAME) + (abbr ? ", " + abbr : ""),
+          lat: a.CENTLAT != null ? parseFloat(a.CENTLAT) : null,
+          lon: a.CENTLON != null ? parseFloat(a.CENTLON) : null,
+          match_type: layer === 4 ? "incorporated_place" : "census_designated_place",
+        };
+      });
+    }
+  }
+  if (anyUpstreamError) return { _error: anyUpstreamError };
+  return [];
+}
+
 async function censusGeocode(address) {
   const u = `https://geocoding.geo.census.gov/geocoder/locations/onelineaddress?address=${encodeURIComponent(address)}&benchmark=Public_AR_Current&format=json`;
   const d = await getJSON(u, { ttl: 86400 });
@@ -82,8 +156,8 @@ function dkDescribe(ts) { try { for (const t of ts) { const p = ((t.inputSchema 
 const TOOLS = [
   {
     name: "geocode",
-    description: "Convert a US street address into latitude/longitude coordinates (US Census geocoder). Use this first when you have an address but need coordinates for the weather/elevation tools. US addresses only.",
-    inputSchema: { type: "object", properties: { address: { type: "string", description: "A US street address, e.g. '1600 Pennsylvania Ave NW, Washington DC'" } }, required: ["address"] },
+    description: "Convert a US street address OR a city/town name into latitude/longitude coordinates, using US Census data. Accepts both '1600 Pennsylvania Ave NW, Washington DC' and 'Chicago, IL' - a place name returns the centroid of the city. Call this first whenever you have a location as text and need coordinates for the weather or elevation tools. US locations only.",
+    inputSchema: { type: "object", properties: { address: { type: "string", description: "A US street address ('1600 Pennsylvania Ave NW, Washington DC') or a city or town ('Chicago, IL', 'Springdale, Arkansas')" } }, required: ["address"] },
   },
   {
     name: "weather_forecast",
@@ -121,10 +195,21 @@ const TOOLS = [
 
 async function runTool(name, args) {
   if (name === "geocode") {
-    if (!args.address) return { error: "Provide a US 'address'." };
-    const m = await censusGeocode(args.address);
-    if (m && m._error) return { error: "The US Census geocoder is not answering right now (" + m._error + "). This is an upstream failure, NOT a statement that '" + args.address + "' is not a real address. Try again shortly." }; if (!m || !m.length) return { error: `No US address match for '${args.address}'. The Census geocoder matches street addresses, so include house number, street, city and state (a ZIP helps); it cannot match a city, landmark or place name on its own.` };
-    return { query: args.address, matches: m, source: "US Census Bureau geocoder (public domain)" };
+    if (!args.address) return { error: "Provide a US 'address' or place name." };
+    let m = await censusGeocode(args.address);
+    let matchedBy = "street_address";
+    if (!m || (!m._error && !m.length)) {
+      // The street-address geocoder found nothing. That is not the same as
+      // "no such place" - try the Census place gazetteer before giving up.
+      const p = await censusPlace(args.address);
+      if (p && p._error) return { error: "The US Census address geocoder found no street match for '" + args.address + "', and the Census place service is not answering right now (" + p._error + "). This is an upstream failure, NOT a statement that the place does not exist. Try again shortly." };
+      if (p && p.length) { m = p; matchedBy = "place_name"; }
+    }
+    if (m && m._error) return { error: "The US Census geocoder is not answering right now (" + m._error + "). This is an upstream failure, NOT a statement that '" + args.address + "' is not a real address. Try again shortly." }; if (!m || !m.length) return { error: `No US match for '${args.address}'. Both the Census street-address geocoder and the Census place gazetteer were checked. For a street address include house number, street, city and state (a ZIP helps); for a town use 'City, ST'. Landmarks and business names are not searchable, and non-US locations are out of scope.` };
+    return { query: args.address, matched_by: matchedBy, matches: m,
+      source: matchedBy === "place_name"
+        ? "US Census Bureau TIGERweb place gazetteer (public domain)"
+        : "US Census Bureau geocoder (public domain)" };
   }
 
   if (name === "weather_forecast" || name === "weather_current") {
@@ -221,7 +306,7 @@ async function handleMCP(request, env) {
   if (method === "initialize") {
     return json(rpc(id, {
       protocolVersion: dkProto(params), capabilities: { tools: {} }, serverInfo: SERVER,
-      instructions: "Weather & Geo Intel: US weather forecasts, current conditions, active NWS alerts, recent earthquakes (USGS), ground elevation, and US address geocoding. Have an address? Call geocode first to get lat/lon, then the weather tools.",
+      instructions: "Weather & Geo Intel: US weather forecasts, current conditions, active NWS alerts, recent earthquakes (USGS), ground elevation, and US address geocoding. Have a location as text - a street address or just a city like 'Chicago, IL'? Call geocode first to get lat/lon, then the weather tools.",
     }));
   }
   if (method === "notifications/initialized" || method === "notifications/cancelled") return new Response(null, { status: 202, headers: CORS });
@@ -278,7 +363,7 @@ function landing(host) {
 <section class="hero"><h1>Give your agent a <span class="accent">window on the ground</span>.</h1>
 <p class="sub">Weather &amp; Geo Intel serves live US forecasts, current conditions and active alerts from the National Weather Service, plus recent earthquakes and elevation from USGS and US address geocoding. All from keyless US-government feeds. No API keys.</p></section>
 <section class="section" id="tools"><h2>Tools</h2><div class="grid">
-<div class="card"><h3><code>geocode</code></h3><p>US address &rarr; latitude/longitude.</p></div>
+<div class="card"><h3><code>geocode</code></h3><p>US address or city name &rarr; latitude/longitude.</p></div>
 <div class="card"><h3><code>weather_forecast</code></h3><p>Multi-day or hourly NWS forecast.</p></div>
 <div class="card"><h3><code>weather_current</code></h3><p>Latest observed conditions.</p></div>
 <div class="card"><h3><code>weather_alerts</code></h3><p>Active warnings by US state.</p></div>
